@@ -1,4 +1,4 @@
--- VBL Script v4: readable, standalone Matcha drawing GUI.
+-- VBL Script v5: readable, standalone Matcha drawing GUI.
 -- Feature reference: 0x1cx/random-lua revision a46fe389 (April 3 2026).
 -- Resizer behavior also based on Luna7070/585438 v1.2/v2.0. Original hitbox credit: huss.
 -- No remote code, memory offsets, or executable config files.
@@ -20,6 +20,7 @@ local defaults = {
     receiveAction = "Bump", counter = false, counterKey = 0x45,
     counterReach = 4, counterSpeed = 25, counterLead = 40,
     counterMode = "Always", receiveFilter = "Serves / spikes", attackSpeed = 25,
+    ballTracker = false, incomingIndicator = false,
 }
 local limits = {
     size={0.1,30}, segments={3,24}, marker={4,40}, gravity={1,200}, ground={-100,100},
@@ -84,6 +85,9 @@ local lastMouse, lastScan, lastResize = false,-100,-100
 local airborne, jumpRoot, wasGrounded = false,nil,nil
 local lastRotation, rotationDone = 0,false
 local rotationHumanoid, originalAutoRotate = nil,nil
+local takeoffUntil = 0
+local rotationStatus = "Waiting for a jump; hide the menu to activate"
+local resizeStatus = "Disabled"
 local receiveOriginals, receiveTargets = {},{}
 local groundStatus = "Checking ground contact"
 local setHeld, releaseAt, nextSet = false,0,0
@@ -336,21 +340,28 @@ local function resizePart(part)
     local id=part.Address
     if not originals[id] then originals[id]={part=part,size=part.Size} end
     part.Size=Vector3.new(cfg.size,cfg.size,cfg.size)
+    local size=part.Size
+    assert(math.abs(size.X-cfg.size)<0.01 and math.abs(size.Y-cfg.size)<0.01 and math.abs(size.Z-cfg.size)<0.01,"Size write not retained")
 end
 local function resizeBalls()
-    if not cfg.resize then return end
-    for _,part in ipairs(balls) do pcall(resizePart,part) end
+    if not cfg.resize then resizeStatus="Disabled"; return end
+    local applied,failed=0,0
+    local function apply(part)
+        if pcall(resizePart,part) then applied=applied+1 else failed=failed+1 end
+    end
+    for _,part in ipairs(balls) do apply(part) end
     local assets=game:GetService("ReplicatedStorage"):FindFirstChild("Assets")
     local folder=assets and assets:FindFirstChild("Ball")
     if folder then
         for _,model in ipairs(folder:GetChildren()) do
             if model:IsA("Model") then
                 for _,part in ipairs(model:GetDescendants()) do
-                    if part:IsA("BasePart") then pcall(resizePart,part) end
+                    if part:IsA("BasePart") then apply(part) end
                 end
             end
         end
     end
+    resizeStatus=string.format("%d size writes verified | %d failed",applied,failed)
 end
 local function project(v)
     local p,visible=WorldToScreen(v)
@@ -426,17 +437,47 @@ local function facingLines()
         if not ok then status="LOS unavailable: this runtime lacks BasePart.CFrame" end
     end
 end
+local function ballOverlay(root,now)
+    if not root or not (cfg.ballTracker or cfg.incomingIndicator) then return end
+    for _,ball in ipairs(assistBalls) do
+        pcall(function()
+            local id=ball.Address
+            local m=motion[id]
+            local p=project(ball.Position)
+            if not p then return end
+            local relative=ball.Position-root.Position
+            local label=string.format("Ball | %.1f studs",relative.Magnitude)
+            local color=palettes[cfg.predictionColor]
+            if m and m.t==now and m.v then
+                label=label..string.format(" | %.0f studs/s",m.v.Magnitude)
+                if cfg.incomingIndicator then
+                    local v=m.v-root.Velocity
+                    local approach=relative.X*v.X+relative.Y*v.Y+relative.Z*v.Z<0
+                    label=label..(approach and " | APPROACHING" or " | MOVING AWAY")
+                    color=palettes[approach and "Rose" or "Green"]
+                end
+            end
+            draw("ballmarker"..id,"Circle",{Position=p,Radius=9,NumSides=24,Filled=false,
+                Thickness=2,Color=color,Transparency=1,ZIndex=16})
+            text("ballinfo"..id,label,p.X+14,p.Y-8,13,color,17)
+        end)
+    end
+end
 local function jumpRotation(root,grounded,allowed,now)
     if not root or root.Address~=jumpRoot then
-        restoreAutoRotate(); airborne=false; wasGrounded=nil; rotationDone=false
+        restoreAutoRotate(); airborne=false; wasGrounded=nil; rotationDone=false; takeoffUntil=0
         jumpRoot=root and root.Address or nil
     end
     if not root then return end
     local vy=root.Velocity.Y
     if grounded==true then
-        airborne=false; rotationDone=false; restoreAutoRotate()
-    elseif grounded==false and wasGrounded==true and vy>1 then
-        airborne=true; rotationDone=false; lastRotation=0
+        airborne=false; rotationDone=false; takeoffUntil=0; restoreAutoRotate()
+    elseif grounded==false then
+        -- FloorMaterial can update one frame before upward velocity.
+        if wasGrounded==true then takeoffUntil=now+0.2 end
+        if not airborne and now<=takeoffUntil and vy>1 then
+            airborne=true; rotationDone=false; lastRotation=0; takeoffUntil=0
+        end
     end
     wasGrounded=grounded
     if not allowed or not cfg.rotation or grounded==nil then
@@ -444,7 +485,7 @@ local function jumpRotation(root,grounded,allowed,now)
     end
     if not airborne or (cfg.mode=="Snap" and rotationDone) then return end
     if now-lastRotation<1/30 then return end
-    local ok=pcall(function()
+    local ok,err=pcall(function()
         local current=root.CFrame
         assert(current and current.LookVector,"Jump rotation needs BasePart.CFrame support")
         local p=current.Position or root.Position
@@ -472,12 +513,17 @@ local function jumpRotation(root,grounded,allowed,now)
         -- Read position immediately before the write; never restore old jump position or velocity.
         local fresh=root.CFrame.Position or root.Position
         root.CFrame=CFrame.new(fresh.X,fresh.Y,fresh.Z,c,0,s,0,1,0,-s,0,c)
+        local look=root.CFrame.LookVector
+        assert(math.abs(look.X+s)<0.05 and math.abs(look.Z+c)<0.05,"Rotation write not retained")
+        rotationStatus="Rotation write verified ("..cfg.mode..")"
         lastRotation=now
     end)
     if not ok then
         restoreAutoRotate()
         set("rotation",false)
-        status="Jump rotation unavailable: this runtime lacks writable BasePart.CFrame"
+        rotationStatus=tostring(err):gsub("^.-:%d+: ",""):sub(1,70)
+        status="Jump rotation unavailable; see Movement diagnostics"
+        print("[VBL] Jump rotation: "..tostring(err))
     end
 end
 local function dot(a,b) return a.X*b.X+a.Y*b.Y+a.Z*b.Z end
@@ -659,10 +705,13 @@ local function renderMenu()
     text("pagetitle",page,x+183,y+67,20)
     row=0
     if page=="Ball" then
-        toggle("resize","Ball resizer","Live balls + replicated ball templates")
+        toggle("resize","Ball hitbox extender","Resizes live ball parts + replicated ball templates")
         slider("size","Ball size",0.1,30,0.1," studs")
         rowBase("Restore on disable","Original sizes restored when disabled or stopped")
         rowBase("Live ball parts",tostring(#balls).." detected in this server")
+        rowBase("Size write verification",resizeStatus)
+        toggle("ballTracker","Ball tracker","Ball marker, distance and measured speed")
+        toggle("incomingIndicator","Incoming indicator","Approaching / moving away relative to your character")
     elseif page=="Character" then
         toggle("receiveHitbox","Receive hitbox resizer","Only identified receive/bump hitbox parts")
         slider("receiveScale","Hitbox scale",1,5,0.1,"x")
@@ -674,6 +723,8 @@ local function renderMenu()
         choice("mode","Rotation mode",{"Snap","Free"})
         rowBase("Snap / Free","Once per jump / limited turns while airborne")
         rowBase("Runtime compatibility","Requires writable BasePart.CFrame; no raw memory writes")
+        rowBase("Rotation diagnostics",rotationStatus)
+        rowBase("Ground contact",groundStatus)
     elseif page=="Prediction" then
         toggle("predictor","Ball landing prediction","Estimated path from measured ball motion")
         choice("trajectory","Trajectory style",{"Line","Arrows"})
@@ -774,7 +825,7 @@ local function frame()
     jumpRotation(root,grounded,active and not opened,now)
     trackApproaches(now,root,active and not opened)
     if active then
-        prediction(now); facingLines()
+        prediction(now); facingLines(); ballOverlay(root,now)
         renderMenu()
     end
     if not running then return end
