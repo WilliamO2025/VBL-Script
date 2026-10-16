@@ -8,6 +8,8 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/WilliamO2025/VBL-Scri
 
 Open the menu with **F1**, or your saved menu key. Start in a fresh script session if the previous ball-resizer-only version is still running.
 
+The menu leaves game input enabled, so you can move your character and interact with the game while it is open. Mouse clicks on the overlay may also reach the game.
+
 ## Implemented behavior
 
 - Ball resizing: 0.1–30 studs; updates live `CLIENT_BALL_` models and replicated ball templates. Disabling or stopping restores recorded sizes where the parts still exist.
