@@ -433,7 +433,7 @@ local function frame()
             end
         elseif keyEdges[cfg.menuKey] then
             opened=not opened; dragging=nil; sliderDrag=nil
-            releaseSet(); pcall(setrobloxinput,not opened)
+            releaseSet(); pcall(setrobloxinput,true)
         end
         if opened and clicked and over(x,y+3,w-180,52) then dragging={mouseX-x,mouseY-y} end
         if dragging and held then x=math.max(0,mouseX-dragging[1]); y=math.max(0,mouseY-dragging[2]) end
@@ -457,7 +457,8 @@ local function frame()
     if dirtyAt and now-dirtyAt>=0.35 and now-savedAt>=0.5 then save() end
 end
 assert(type(Drawing)=="table" and type(iskeypressed)=="function","VBL requires Matcha drawing and input APIs")
-pcall(setrobloxinput,false)
+-- The overlay stays interactive without disabling game input.
+pcall(setrobloxinput,true)
 task.spawn(function()
     while running do
         local ok,err=pcall(frame)
