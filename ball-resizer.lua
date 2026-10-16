@@ -1,4 +1,4 @@
--- VBL Script v7: readable, standalone Matcha drawing GUI.
+-- VBL Script v8: readable, standalone Matcha drawing GUI.
 -- Feature reference: 0x1cx/random-lua revision a46fe389 (April 3 2026).
 -- Resizer behavior also based on Luna7070/585438 v1.2/v2.0. Original hitbox credit: huss.
 -- No remote code or executable config. Rotation uses validated, rotation-only memory writes.
@@ -82,10 +82,9 @@ local x,y,w,h = 110,100,700,565
 local mouseX,mouseY,clicked,held = 0,0,false,false
 local previousKeys, dragging, sliderDrag, binding = {}, nil,nil,nil
 local lastMouse, lastScan, lastResize = false,-100,-100
-local airborne, jumpRoot, wasGrounded = false,nil,nil
+local airborne, jumpRoot = false,nil
 local lastRotation, rotationDone = 0,false
-local takeoffUntil = 0
-local previousJumpVelocity = 0
+local previousJumpY = nil
 local rotationStatus = "Waiting for a jump; hide the menu to activate"
 local resizeStatus = "Disabled"
 local receiveOriginals, receiveTargets = {},{}
@@ -492,7 +491,7 @@ local function rotationPose(root)
             assert(finite(coordinate) and math.abs(coordinate-p[axis])<0.15,"Position data not synchronized")
         end
     end
-    return {root=root.Address,primitive=primitive,p=p,look=look}
+    return {root=root.Address,primitive=primitive,p=Vector3.new(p.X,p.Y,p.Z),look=Vector3.new(look.X,look.Y,look.Z)}
 end
 local function validateRotation(root)
     local ok,pose=pcall(rotationPose,root)
@@ -506,39 +505,33 @@ local function validateRotation(root)
     if not pose.ready then rotationStatus="Validation: move or turn slightly, then jump"; return nil end
     return pose
 end
-local function jumpRotation(root,grounded,allowed,now)
+local function jumpRotation(root,allowed,now)
     if not root or root.Address~=jumpRoot then
-        airborne=false; wasGrounded=nil; rotationDone=false; takeoffUntil=0
-        previousJumpVelocity=0; rotationProbe=nil
+        airborne=false; rotationDone=false; previousJumpY=nil; rotationProbe=nil
         jumpRoot=root and root.Address or nil
     end
-    if not root then return end
-    local pose=cfg.rotation and validateRotation(root) or nil
-    local vy=root.Velocity.Y
-    if grounded==true then
-        airborne=false; rotationDone=false; takeoffUntil=0
-    elseif grounded==false then
-        -- FloorMaterial can update one frame before upward velocity.
-        if wasGrounded==true then takeoffUntil=now+0.2 end
-        if not airborne and now<=takeoffUntil and vy>1 then
-            airborne=true; rotationDone=false; lastRotation=0; takeoffUntil=0
-        end
-    elseif grounded==nil then
-        -- Rotation used velocity in the earlier working version. Ground APIs are
-        -- optional here only; auto receive still requires confirmed ground.
-        if vy>5 and previousJumpVelocity<=5 then
-            airborne=true; rotationDone=false; lastRotation=0
-        elseif vy<=1 then
-            -- Unknown contact: finish at the apex, never guess a landing height.
-            airborne=false; rotationDone=false
-        end
+    if not root then rotationStatus="Waiting for character"; return end
+    local currentY,vy=root.Position.Y,root.Velocity.Y
+    local rising=previousJumpY and currentY-previousJumpY>0.01
+    previousJumpY=currentY
+    if not cfg.rotation or not allowed then
+        airborne=false; rotationDone=false
+        rotationStatus=not cfg.rotation and "Disabled" or "Paused: game not focused"
+        return
     end
-    previousJumpVelocity=vy
-    wasGrounded=grounded
-    if not allowed or not cfg.rotation then
-        airborne=false; rotationDone=false; return
+    -- Rotation follows observed ascent, independent of an unreliable ground probe.
+    -- Requiring both upward velocity and displacement avoids rotating on a stale impulse.
+    if vy<=1 then airborne=false; rotationDone=false
+    elseif not airborne and vy>5 and rising then
+        airborne=true; rotationDone=false; lastRotation=0
     end
-    if not pose or not airborne or (cfg.mode=="Snap" and rotationDone) then return end
+    local pose=validateRotation(root)
+    if not pose then return end
+    if not airborne then
+        rotationStatus=string.format("Validated | waiting for ascent (vertical speed %.1f)",vy)
+        return
+    end
+    if cfg.mode=="Snap" and rotationDone then rotationStatus="Snap complete for this ascent"; return end
     if now-lastRotation<1/30 then return end
     local ok,err=pcall(function()
         -- Re-read and validate immediately before writing; never cache a respawn pointer.
@@ -549,11 +542,11 @@ local function jumpRotation(root,grounded,allowed,now)
         local p=checked.p
         local camera=workspace.CurrentCamera.Position
         local dx,dz=p.X-camera.X,p.Z-camera.Z
-        if dx*dx+dz*dz<0.001 then return end
+        if dx*dx+dz*dz<0.001 then rotationStatus="Paused: camera directly above character"; return end
         local angle=math.atan2(dx,dz)+math.pi
         local heading=math.atan2(-checked.look.X,-checked.look.Z)
         local delta=(angle-heading+math.pi)%(2*math.pi)-math.pi
-        if math.abs(delta)<math.rad(2) then rotationDone=true; return end
+        if math.abs(delta)<math.rad(2) then rotationDone=true; rotationStatus="Validated | already facing target"; return end
         if cfg.mode=="Free" then
             local maxTurn=math.rad(360)*math.min(now-lastRotation,0.05)
             angle=heading+math.max(-maxTurn,math.min(maxTurn,delta))
@@ -742,7 +735,7 @@ local function renderMenu()
     box("window",x,y,w,h,uiColor.bg,100)
     box("accent",x,y,w,3,palettes[cfg.accent],101)
     text("brand","VBL",x+20,y+18,26,palettes[cfg.accent])
-    text("version","SCRIPT / 07",x+82,y+26,12,uiColor.muted)
+    text("version","SCRIPT / 08",x+82,y+26,12,uiColor.muted)
     text("subtitle","COURT CONTROL",x+20,y+62,10,uiColor.muted)
     button("hide","Hide",x+w-158,y+17,66,34,function() opened=false; releaseSet(); pcall(setrobloxinput,true) end)
     button("stop","Stop",x+w-82,y+17,62,34,stop)
@@ -770,11 +763,11 @@ local function renderMenu()
     elseif page=="Movement" then
         toggle("rotation","Jump rotation","Faces away from camera during a jump")
         choice("mode","Rotation mode",{"Snap","Free"})
-        rowBase("Snap / Free","Once per jump / limited turns while airborne")
+        rowBase("Snap / Free","Once per ascent / limited turns while rising")
         rowBase("Runtime compatibility","Validated rotation memory; position / velocity never written")
         rowBase("Rotation diagnostics",rotationStatus)
         rowBase("Ground contact",groundStatus)
-        rowBase("Rotation fallback","Without ground APIs: upward motion only; receive stays strict")
+        rowBase("Jump detection","Upward velocity + rising position; works with menu open")
     elseif page=="Prediction" then
         toggle("predictor","Ball landing prediction","Estimated path from measured ball motion")
         choice("trajectory","Trajectory style",{"Line","Arrows"})
@@ -872,7 +865,7 @@ local function frame()
     if now-lastResize>=0.2 then resizeBalls(); updateReceiveHitbox(); lastResize=now end
     local root=rootPart(LocalPlayer)
     local grounded=isGrounded(root)
-    jumpRotation(root,grounded,active and not opened,now)
+    jumpRotation(root,active,now)
     trackApproaches(now,root,active and not opened)
     if active then
         prediction(now); facingLines(); ballOverlay(root,now)
