@@ -1,8 +1,8 @@
--- VBL Script v6: readable, standalone Matcha drawing GUI.
+-- VBL Script v7: readable, standalone Matcha drawing GUI.
 -- Feature reference: 0x1cx/random-lua revision a46fe389 (April 3 2026).
 -- Resizer behavior also based on Luna7070/585438 v1.2/v2.0. Original hitbox credit: huss.
--- No remote code, memory offsets, or executable config files.
--- BasePart.CFrame support varies by runtime; unsupported rotation is reported in the GUI.
+-- No remote code or executable config. Rotation uses validated, rotation-only memory writes.
+-- Layout candidates observed in the user's Matcha diagnostic; checked against live pose before use.
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local Http = game:GetService("HttpService")
@@ -84,9 +84,8 @@ local previousKeys, dragging, sliderDrag, binding = {}, nil,nil,nil
 local lastMouse, lastScan, lastResize = false,-100,-100
 local airborne, jumpRoot, wasGrounded = false,nil,nil
 local lastRotation, rotationDone = 0,false
-local rotationHumanoid, originalAutoRotate = nil,nil
 local takeoffUntil = 0
-local previousJumpVelocity, lastHeading = 0,nil
+local previousJumpVelocity = 0
 local rotationStatus = "Waiting for a jump; hide the menu to activate"
 local resizeStatus = "Disabled"
 local receiveOriginals, receiveTargets = {},{}
@@ -133,14 +132,10 @@ local function restoreReceiveHitbox()
         receiveOriginals[id]=nil
     end
 end
-local function restoreAutoRotate()
-    if rotationHumanoid then pcall(function() rotationHumanoid.AutoRotate=originalAutoRotate end) end
-    rotationHumanoid=nil; originalAutoRotate=nil
-end
 local function stop()
     if not running then return end
     running=false
-    releaseSet(); restoreSizes(); restoreReceiveHitbox(); restoreAutoRotate()
+    releaseSet(); restoreSizes(); restoreReceiveHitbox()
     if dirtyAt then save() end
     pcall(function() setrobloxinput(true) end)
     for _,d in pairs(draws) do pcall(function() d:Remove() end) end
@@ -464,16 +459,64 @@ local function ballOverlay(root,now)
         end)
     end
 end
+-- Candidate layout from the user's diagnostic, not blindly trusted offsets.
+local rotationProbe=nil
+local function rotationPose(root)
+    assert(type(memory_read)=="function" and type(memory_write)=="function","Matcha memory APIs unavailable")
+    local primitive=memory_read("uintptr_t",root.Address+0x180)
+    assert(type(primitive)=="number" and primitive>=65536 and primitive<2^47 and primitive%8==0,"Rotation pointer unavailable")
+    local p,look=root.Position,root.CFrame.LookVector
+    local function finite(n) return type(n)=="number" and n==n and math.abs(n)<math.huge end
+    assert(p and look and finite(p.X) and finite(p.Y) and finite(p.Z) and finite(look.X) and finite(look.Y) and finite(look.Z),"Pose unavailable")
+    for _,offset in ipairs({0xB0,0xF8}) do
+        local m={}
+        for i=1,9 do
+            m[i]=memory_read("float",primitive+offset+(i-1)*4)
+            assert(finite(m[i]) and math.abs(m[i])<=1.01,"Invalid rotation matrix")
+        end
+        for row=0,2 do
+            local length=0
+            for k=1,3 do length=length+m[row*3+k]^2 end
+            assert(math.abs(length-1)<0.03,"Invalid rotation row")
+            for other=row+1,2 do
+                local dot=0
+                for k=1,3 do dot=dot+m[row*3+k]*m[other*3+k] end
+                assert(math.abs(dot)<0.03,"Invalid rotation basis")
+            end
+        end
+        local det=m[1]*(m[5]*m[9]-m[6]*m[8])-m[2]*(m[4]*m[9]-m[6]*m[7])+m[3]*(m[4]*m[8]-m[5]*m[7])
+        assert(math.abs(det-1)<0.05,"Invalid rotation determinant")
+        assert(math.max(math.abs(m[3]+look.X),math.abs(m[6]+look.Y),math.abs(m[9]+look.Z))<0.08,"Facing data not synchronized")
+        for i,axis in ipairs({"X","Y","Z"}) do
+            local coordinate=memory_read("float",primitive+offset+36+(i-1)*4)
+            assert(finite(coordinate) and math.abs(coordinate-p[axis])<0.15,"Position data not synchronized")
+        end
+    end
+    return {root=root.Address,primitive=primitive,p=p,look=look}
+end
+local function validateRotation(root)
+    local ok,pose=pcall(rotationPose,root)
+    if not ok then rotationProbe=nil; rotationStatus="Paused: "..tostring(pose):gsub("^.-:%d+: ",""):sub(1,60); return nil end
+    local old=rotationProbe
+    if old and old.root==pose.root and old.primitive==pose.primitive then
+        pose.ready=old.ready or (pose.p-old.p).Magnitude>0.05 or (pose.look-old.look).Magnitude>0.05
+    end
+    -- Keep the first sample until enough movement is observed.
+    if not old or old.root~=pose.root or old.primitive~=pose.primitive or pose.ready then rotationProbe=pose end
+    if not pose.ready then rotationStatus="Validation: move or turn slightly, then jump"; return nil end
+    return pose
+end
 local function jumpRotation(root,grounded,allowed,now)
     if not root or root.Address~=jumpRoot then
-        restoreAutoRotate(); airborne=false; wasGrounded=nil; rotationDone=false; takeoffUntil=0
-        previousJumpVelocity=0; lastHeading=nil
+        airborne=false; wasGrounded=nil; rotationDone=false; takeoffUntil=0
+        previousJumpVelocity=0; rotationProbe=nil
         jumpRoot=root and root.Address or nil
     end
     if not root then return end
+    local pose=cfg.rotation and validateRotation(root) or nil
     local vy=root.Velocity.Y
     if grounded==true then
-        airborne=false; rotationDone=false; takeoffUntil=0; lastHeading=nil; restoreAutoRotate()
+        airborne=false; rotationDone=false; takeoffUntil=0
     elseif grounded==false then
         -- FloorMaterial can update one frame before upward velocity.
         if wasGrounded==true then takeoffUntil=now+0.2 end
@@ -484,62 +527,48 @@ local function jumpRotation(root,grounded,allowed,now)
         -- Rotation used velocity in the earlier working version. Ground APIs are
         -- optional here only; auto receive still requires confirmed ground.
         if vy>5 and previousJumpVelocity<=5 then
-            airborne=true; rotationDone=false; lastRotation=0; lastHeading=nil
+            airborne=true; rotationDone=false; lastRotation=0
         elseif vy<=1 then
             -- Unknown contact: finish at the apex, never guess a landing height.
-            airborne=false; rotationDone=false; restoreAutoRotate()
+            airborne=false; rotationDone=false
         end
     end
     previousJumpVelocity=vy
     wasGrounded=grounded
     if not allowed or not cfg.rotation then
-        airborne=false; rotationDone=false; restoreAutoRotate(); return
+        airborne=false; rotationDone=false; return
     end
-    if not airborne or (cfg.mode=="Snap" and rotationDone) then return end
+    if not pose or not airborne or (cfg.mode=="Snap" and rotationDone) then return end
     if now-lastRotation<1/30 then return end
     local ok,err=pcall(function()
-        local current=root.CFrame
-        assert(current,"Jump rotation needs BasePart.CFrame support")
-        local function position()
-            local ok,value=pcall(function() return root.CFrame.Position end)
-            return ok and value or root.Position
-        end
-        local p=position()
+        -- Re-read and validate immediately before writing; never cache a respawn pointer.
+        local checked=rotationPose(root)
+        assert(checked.primitive==pose.primitive,"Character primitive changed")
+        local liveRoot=rootPart(LocalPlayer)
+        assert(liveRoot and liveRoot.Address==root.Address,"Character changed")
+        local p=checked.p
         local camera=workspace.CurrentCamera.Position
         local dx,dz=p.X-camera.X,p.Z-camera.Z
         if dx*dx+dz*dz<0.001 then return end
         local angle=math.atan2(dx,dz)+math.pi
-        local heading=lastHeading
-        -- Some Matcha builds expose a writable frame without LookVector.
-        local readable,look=pcall(function() return current.LookVector end)
-        if readable and look then heading=math.atan2(-look.X,-look.Z) end
-        heading=heading or angle
+        local heading=math.atan2(-checked.look.X,-checked.look.Z)
         local delta=(angle-heading+math.pi)%(2*math.pi)-math.pi
-        rotationDone=true
-        if (readable and look or lastHeading) and math.abs(delta)<math.rad(2) then return end
-        if not rotationHumanoid then
-            local h=humanoid()
-            if h then pcall(function()
-                if type(h.AutoRotate)=="boolean" then
-                    originalAutoRotate=h.AutoRotate; rotationHumanoid=h; h.AutoRotate=false
-                end
-            end) end
-        end
+        if math.abs(delta)<math.rad(2) then rotationDone=true; return end
         if cfg.mode=="Free" then
             local maxTurn=math.rad(360)*math.min(now-lastRotation,0.05)
             angle=heading+math.max(-maxTurn,math.min(maxTurn,delta))
         end
         local c,s=math.cos(angle),math.sin(angle)
-        -- Read position immediately before the write; never restore old jump position or velocity.
-        local fresh=position()
-        root.CFrame=CFrame.new(fresh.X,fresh.Y,fresh.Z,c,0,s,0,1,0,-s,0,c)
-        -- Reads can lag writes in external runtimes; do not disable on immediate readback.
-        lastHeading=angle
-        rotationStatus="Rotation submitted ("..cfg.mode..")"..(grounded==nil and " | velocity fallback" or "")
+        local matrix={c,0,s,0,1,0,-s,0,c}
+        -- Only these 18 floats are writable. Adjacent positions and velocities are never written.
+        for _,offset in ipairs({0xB0,0xF8}) do
+            for i=1,9 do memory_write("float",checked.primitive+offset+(i-1)*4,matrix[i]) end
+        end
+        rotationDone=true
+        rotationStatus="Rotation-only write ("..cfg.mode..")"
         lastRotation=now
     end)
     if not ok then
-        restoreAutoRotate()
         set("rotation",false)
         rotationStatus=tostring(err):gsub("^.-:%d+: ",""):sub(1,70)
         status="Jump rotation unavailable; see Movement diagnostics"
@@ -713,7 +742,7 @@ local function renderMenu()
     box("window",x,y,w,h,uiColor.bg,100)
     box("accent",x,y,w,3,palettes[cfg.accent],101)
     text("brand","VBL",x+20,y+18,26,palettes[cfg.accent])
-    text("version","SCRIPT / 06",x+82,y+26,12,uiColor.muted)
+    text("version","SCRIPT / 07",x+82,y+26,12,uiColor.muted)
     text("subtitle","COURT CONTROL",x+20,y+62,10,uiColor.muted)
     button("hide","Hide",x+w-158,y+17,66,34,function() opened=false; releaseSet(); pcall(setrobloxinput,true) end)
     button("stop","Stop",x+w-82,y+17,62,34,stop)
@@ -742,7 +771,7 @@ local function renderMenu()
         toggle("rotation","Jump rotation","Faces away from camera during a jump")
         choice("mode","Rotation mode",{"Snap","Free"})
         rowBase("Snap / Free","Once per jump / limited turns while airborne")
-        rowBase("Runtime compatibility","Requires writable BasePart.CFrame; no raw memory writes")
+        rowBase("Runtime compatibility","Validated rotation memory; position / velocity never written")
         rowBase("Rotation diagnostics",rotationStatus)
         rowBase("Ground contact",groundStatus)
         rowBase("Rotation fallback","Without ground APIs: upward motion only; receive stays strict")
@@ -793,7 +822,7 @@ local function renderMenu()
         local ry=rowBase("Configuration",saveStatus)
         button("save","Save",x+w-180,ry+8,66,35,save)
         button("reset","Reset",x+w-104,ry+8,72,35,function()
-            releaseSet(); restoreSizes(); restoreReceiveHitbox(); restoreAutoRotate()
+            releaseSet(); restoreSizes(); restoreReceiveHitbox()
             for k,v in pairs(defaults) do cfg[k]=v end
             save(); status="Defaults restored"
         end)
