@@ -15,11 +15,12 @@ local defaults = {
     autoSet = false, setDistance = 5, setKey = 0x51, cooldown = 0.5,
     menuKey = 0x70, accent = "Violet", predictionColor = "Cyan",
     teamColor = "Green", enemyColor = "Rose",
+    receiveHitbox = false, receiveScale = 1.5,
 }
 local limits = {
     size={0.1,30}, segments={3,24}, marker={4,40}, gravity={1,200}, ground={-100,100},
     length={3,30}, thickness={1,6}, setDistance={1,20}, cooldown={0.2,2},
-    menuKey={8,255}, setKey={8,255},
+    menuKey={8,255}, setKey={8,255}, receiveScale={1,5},
 }
 local palettes = {
     Violet=Color3.fromRGB(167,139,250), Cyan=Color3.fromRGB(65,210,230),
@@ -73,7 +74,11 @@ local x,y,w,h = 110,100,700,505
 local mouseX,mouseY,clicked,held = 0,0,false,false
 local previousKeys, dragging, sliderDrag, binding = {}, nil,nil,nil
 local lastMouse, lastScan, lastResize = false,-100,-100
-local airborne, jumpY, jumpRoot = false,nil,nil
+local airborne, jumpRoot, wasGrounded = false,nil,nil
+local lastRotation, rotationDone = 0,false
+local rotationHumanoid, originalAutoRotate = nil,nil
+local receiveOriginals, receiveTargets = {},{}
+local groundStatus = "Checking ground contact"
 local setHeld, releaseAt, nextSet = false,0,0
 local keyHeldCode = nil
 local uiColor = {bg=Color3.fromRGB(15,18,27), panel=Color3.fromRGB(23,28,40),
@@ -103,10 +108,20 @@ local function restoreSizes()
         originals[id]=nil
     end
 end
+local function restoreReceiveHitbox()
+    for id,item in pairs(receiveOriginals) do
+        pcall(function() item.part.Size=item.size end)
+        receiveOriginals[id]=nil
+    end
+end
+local function restoreAutoRotate()
+    if rotationHumanoid then pcall(function() rotationHumanoid.AutoRotate=originalAutoRotate end) end
+    rotationHumanoid=nil; originalAutoRotate=nil
+end
 local function stop()
     if not running then return end
     running=false
-    releaseSet(); restoreSizes()
+    releaseSet(); restoreSizes(); restoreReceiveHitbox(); restoreAutoRotate()
     if dirtyAt then save() end
     pcall(function() setrobloxinput(true) end)
     for _,d in pairs(draws) do pcall(function() d:Remove() end) end
@@ -155,6 +170,7 @@ local function toggle(key,title,description)
     button("toggle"..key,cfg[key] and "ON" or "OFF",x+w-92,ry+8,60,35,function()
         set(key,not cfg[key])
         if key=="resize" and not cfg.resize then restoreSizes() end
+        if key=="receiveHitbox" and not cfg.receiveHitbox then restoreReceiveHitbox() end
         if key=="autoSet" and not cfg.autoSet then releaseSet() end
     end,cfg[key])
 end
@@ -187,6 +203,105 @@ end
 local function rootPart(player)
     local char=player.Character
     return char and char:FindFirstChild("HumanoidRootPart")
+end
+local function humanoid()
+    local char=LocalPlayer.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+local function isGrounded(root)
+    if not root then groundStatus="No character"; return nil end
+    local human=humanoid()
+    local ok,contact=pcall(function()
+        if not human then return nil end
+        local material=human.FloorMaterial
+        if material==nil then return nil end
+        local name=tostring(material)
+        if name=="Air" or name=="Enum.Material.Air" or material==0 then return false end
+        -- Accept known enum/numeric material values, not arbitrary unsupported return values.
+        if type(material)=="number" then return material>0 end
+        if name:match("^Enum%.Material%.") then return true end
+        return nil
+    end)
+    if ok and contact~=nil then
+        groundStatus=contact and "Grounded" or "Airborne"
+        return contact
+    end
+    -- A filtered ray is the fallback; zero vertical speed alone is never ground evidence.
+    ok,contact=pcall(function()
+        assert(RaycastParams and Enum,"Ground detection APIs unavailable")
+        local char=LocalPlayer.Character
+        local bottom=nil
+        for _,name in ipairs({"LeftFoot","RightFoot","Left Leg","Right Leg"}) do
+            local foot=char:FindFirstChild(name)
+            if foot then
+                local footBottom=foot.Position.Y-foot.Size.Y/2
+                bottom=bottom and math.min(bottom,footBottom) or footBottom
+            end
+        end
+        assert(bottom,"No feet found for ground detection")
+        local p=root.Position
+        local distance=p.Y-bottom+0.15
+        assert(distance>0 and distance<15,"Invalid ground probe distance")
+        local filter={char}
+        for _,player in ipairs(Players:GetPlayers()) do
+            if player.Character then table.insert(filter,player.Character) end
+        end
+        for _,ball in ipairs(balls) do table.insert(filter,ball) end
+        local params=RaycastParams.new()
+        params.FilterType=Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances=filter
+        params.RespectCanCollide=true
+        local hit=workspace:Raycast(p,Vector3.new(0,-distance,0),params)
+        return hit~=nil and hit.Normal.Y>0.5
+    end)
+    if ok then groundStatus=contact and "Grounded (floor probe)" or "Airborne"; return contact end
+    groundStatus="Ground detection unavailable; auto receive paused"
+    return nil
+end
+local function canReceive(root,grounded)
+    if grounded~=true or not root or iskeypressed(0x20) then return false end
+    local ok,ready=pcall(function()
+        local h=humanoid()
+        if h then
+            local jumpOK,jumping=pcall(function() return h.Jump end)
+            if jumpOK and jumping==true then return false end
+        end
+        return math.abs(root.Velocity.Y)<2
+    end)
+    return ok and ready
+end
+local function updateReceiveHitbox()
+    local char=LocalPlayer.Character
+    local found,seenTargets={},{}
+    if char then
+        for _,part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                local name=part.Name:lower():gsub("[^a-z]","")
+                local parent=part.Parent
+                local parentName=parent and parent.Name:lower():gsub("[^a-z]","") or ""
+                local match=name=="receivehitbox" or name=="receiverhitbox" or name=="receivinghitbox" or name=="bumphitbox"
+                    or (name=="hitbox" and (parentName=="receive" or parentName=="receiving" or parentName=="bump"))
+                if match then
+                    table.insert(found,part)
+                    seenTargets[part.Address]=true
+                    if cfg.receiveHitbox then
+                        pcall(function()
+                            local id=part.Address
+                            if not receiveOriginals[id] then receiveOriginals[id]={part=part,size=part.Size} end
+                            part.Size=receiveOriginals[id].size*cfg.receiveScale
+                        end)
+                    end
+                end
+            end
+        end
+    end
+    receiveTargets=found
+    for id,item in pairs(receiveOriginals) do
+        if not seenTargets[id] or not cfg.receiveHitbox then
+            pcall(function() item.part.Size=item.size end)
+            receiveOriginals[id]=nil
+        end
+    end
 end
 local function collectBalls()
     local found={}
@@ -300,32 +415,64 @@ local function facingLines()
         if not ok then status="LOS unavailable: this runtime lacks BasePart.CFrame" end
     end
 end
-local function jumpRotation(root)
-    if not root then airborne=false; jumpRoot=nil; return end
-    if root.Address~=jumpRoot then airborne=false; jumpY=nil; jumpRoot=root.Address end
-    if not cfg.rotation then airborne=false; return end
-    local p,vy=root.Position,root.Velocity.Y
-    local justJumped=false
-    if not airborne and vy>5 then airborne=true; jumpY=p.Y; justJumped=true end
-    if airborne and jumpY and p.Y<=jumpY+0.5 and math.abs(vy)<2 then airborne=false end
-    if not airborne or (cfg.mode=="Snap" and not justJumped) then return end
+local function jumpRotation(root,grounded,allowed,now)
+    if not root or root.Address~=jumpRoot then
+        restoreAutoRotate(); airborne=false; wasGrounded=nil; rotationDone=false
+        jumpRoot=root and root.Address or nil
+    end
+    if not root then return end
+    local vy=root.Velocity.Y
+    if grounded==true then
+        airborne=false; rotationDone=false; restoreAutoRotate()
+    elseif grounded==false and wasGrounded==true and vy>1 then
+        airborne=true; rotationDone=false; lastRotation=0
+    end
+    wasGrounded=grounded
+    if not allowed or not cfg.rotation or grounded==nil then
+        airborne=false; rotationDone=false; restoreAutoRotate(); return
+    end
+    if not airborne or (cfg.mode=="Snap" and rotationDone) then return end
+    if now-lastRotation<1/30 then return end
     local ok=pcall(function()
-        assert(root.CFrame,"Jump rotation needs BasePart.CFrame support")
+        local current=root.CFrame
+        assert(current and current.LookVector,"Jump rotation needs BasePart.CFrame support")
+        local p=current.Position or root.Position
         local camera=workspace.CurrentCamera.Position
         local dx,dz=p.X-camera.X,p.Z-camera.Z
         if dx*dx+dz*dz<0.001 then return end
         local angle=math.atan2(dx,dz)+math.pi
+        local heading=math.atan2(-current.LookVector.X,-current.LookVector.Z)
+        local delta=(angle-heading+math.pi)%(2*math.pi)-math.pi
+        rotationDone=true
+        if math.abs(delta)<math.rad(2) then return end
+        if not rotationHumanoid then
+            local h=humanoid()
+            if h then pcall(function()
+                if type(h.AutoRotate)=="boolean" then
+                    originalAutoRotate=h.AutoRotate; rotationHumanoid=h; h.AutoRotate=false
+                end
+            end) end
+        end
+        if cfg.mode=="Free" then
+            local maxTurn=math.rad(360)*math.min(now-lastRotation,0.05)
+            angle=heading+math.max(-maxTurn,math.min(maxTurn,delta))
+        end
         local c,s=math.cos(angle),math.sin(angle)
-        root.CFrame=CFrame.new(p.X,p.Y,p.Z,c,0,s,0,1,0,-s,0,c)
+        -- Read position immediately before the write; never restore old jump position or velocity.
+        local fresh=root.CFrame.Position or root.Position
+        root.CFrame=CFrame.new(fresh.X,fresh.Y,fresh.Z,c,0,s,0,1,0,-s,0,c)
+        lastRotation=now
     end)
     if not ok then
+        restoreAutoRotate()
         set("rotation",false)
         status="Jump rotation unavailable: this runtime lacks writable BasePart.CFrame"
     end
 end
-local function autoSet(now,root,active)
-    if setHeld and (now>=releaseAt or not active or opened or not cfg.autoSet or not root) then releaseSet() end
-    if not active or opened or not root or not cfg.autoSet or setHeld or now<nextSet then return end
+local function autoSet(now,root,active,grounded)
+    local ready=canReceive(root,grounded)
+    if setHeld and (now>=releaseAt or not active or opened or not cfg.autoSet or not ready) then releaseSet() end
+    if not active or opened or not ready or not cfg.autoSet or setHeld or now<nextSet then return end
     if type(keypress)~="function" or type(keyrelease)~="function" then
         set("autoSet",false); status="Auto set unavailable: input API missing"; return
     end
@@ -354,7 +501,7 @@ local function renderMenu()
     button("hide","Hide",x+w-158,y+17,66,34,function() opened=false; releaseSet(); pcall(setrobloxinput,true) end)
     button("stop","Stop",x+w-82,y+17,62,34,stop)
     if not running then return end
-    local pages={"Ball","Movement","Prediction","LOS","Assist","Settings"}
+    local pages={"Ball","Character","Movement","Prediction","LOS","Assist","Settings"}
     for i,name in ipairs(pages) do
         button("nav"..name,name,x+16,y+99+(i-1)*47,140,38,function() page=name; sliderDrag=nil end,page==name)
     end
@@ -365,10 +512,16 @@ local function renderMenu()
         slider("size","Ball size",0.1,30,0.1," studs")
         rowBase("Restore on disable","Original sizes restored when disabled or stopped")
         rowBase("Live ball parts",tostring(#balls).." detected in this server")
+    elseif page=="Character" then
+        toggle("receiveHitbox","Receive hitbox resizer","Only identified receive/bump hitbox parts")
+        slider("receiveScale","Hitbox scale",1,5,0.1,"x")
+        rowBase("Detected receive hitboxes",#receiveTargets>0 and tostring(#receiveTargets).." part(s) found" or "None exposed by this character; resizing unavailable")
+        rowBase("Local modification","Server-calculated receive range may remain unchanged")
+        rowBase("Restore on disable","Original hitbox sizes restored on disable or Stop")
     elseif page=="Movement" then
         toggle("rotation","Jump rotation","Faces away from camera during a jump")
         choice("mode","Rotation mode",{"Snap","Free"})
-        rowBase("Snap / Free","Snap once at takeoff / continuously follow camera")
+        rowBase("Snap / Free","Once per jump / limited turns while airborne")
         rowBase("Runtime compatibility","Requires writable BasePart.CFrame; no raw memory writes")
     elseif page=="Prediction" then
         toggle("predictor","Ball landing prediction","Estimated path from measured ball motion")
@@ -385,11 +538,12 @@ local function renderMenu()
         slider("length","Direction length",3,30,1," studs")
         slider("thickness","Line thickness",1,6,1," px")
     elseif page=="Assist" then
-        toggle("autoSet","Auto set / receive","Presses the set key when a ball is close")
+        toggle("autoSet","Auto set / receive","Ground contact required; no mid-air receives")
         slider("setDistance","Trigger distance",1,20,0.5," studs")
         slider("cooldown","Input cooldown",0.2,2,0.1," sec")
         keybind("setKey","Set / receive key")
         rowBase("Focus protection","Paused while this menu is open or Roblox is unfocused")
+        rowBase("Ground contact",groundStatus)
     else
         keybind("menuKey","Menu toggle key")
         choice("accent","Menu accent",{"Violet","Cyan","Green","Rose"})
@@ -399,7 +553,7 @@ local function renderMenu()
         local ry=rowBase("Configuration",saveStatus)
         button("save","Save",x+w-180,ry+8,66,35,save)
         button("reset","Reset",x+w-104,ry+8,72,35,function()
-            releaseSet(); restoreSizes()
+            releaseSet(); restoreSizes(); restoreReceiveHitbox(); restoreAutoRotate()
             for k,v in pairs(defaults) do cfg[k]=v end
             save(); status="Defaults restored"
         end)
@@ -442,15 +596,16 @@ local function frame()
         releaseSet()
     end
     if now-lastScan>=0.5 then collectBalls(); lastScan=now end
-    if now-lastResize>=0.2 then resizeBalls(); lastResize=now end
+    if now-lastResize>=0.2 then resizeBalls(); updateReceiveHitbox(); lastResize=now end
     local root=rootPart(LocalPlayer)
+    local grounded=isGrounded(root)
+    jumpRotation(root,grounded,active and not opened,now)
     if active then
         prediction(now); facingLines()
-        if not opened then jumpRotation(root) end
         renderMenu()
     end
     if not running then return end
-    autoSet(now,root,active)
+    autoSet(now,root,active,grounded)
     for id,d in pairs(draws) do
         if not seen[id] then d:Remove(); draws[id]=nil end
     end
@@ -471,5 +626,5 @@ task.spawn(function()
     end
 end)
 -- Local test seam / useful handle for runtimes that retain loadstring return values.
-return {Stop=stop,Settings=cfg,Set=set,Frame=frame,LandingTime=landingTime}
+return {Stop=stop,Settings=cfg,Set=set,Frame=frame,LandingTime=landingTime,Grounded=isGrounded}
 
