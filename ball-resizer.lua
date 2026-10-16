@@ -1,4 +1,4 @@
--- VBL Script v5: readable, standalone Matcha drawing GUI.
+-- VBL Script v6: readable, standalone Matcha drawing GUI.
 -- Feature reference: 0x1cx/random-lua revision a46fe389 (April 3 2026).
 -- Resizer behavior also based on Luna7070/585438 v1.2/v2.0. Original hitbox credit: huss.
 -- No remote code, memory offsets, or executable config files.
@@ -86,6 +86,7 @@ local airborne, jumpRoot, wasGrounded = false,nil,nil
 local lastRotation, rotationDone = 0,false
 local rotationHumanoid, originalAutoRotate = nil,nil
 local takeoffUntil = 0
+local previousJumpVelocity, lastHeading = 0,nil
 local rotationStatus = "Waiting for a jump; hide the menu to activate"
 local resizeStatus = "Disabled"
 local receiveOriginals, receiveTargets = {},{}
@@ -466,37 +467,56 @@ end
 local function jumpRotation(root,grounded,allowed,now)
     if not root or root.Address~=jumpRoot then
         restoreAutoRotate(); airborne=false; wasGrounded=nil; rotationDone=false; takeoffUntil=0
+        previousJumpVelocity=0; lastHeading=nil
         jumpRoot=root and root.Address or nil
     end
     if not root then return end
     local vy=root.Velocity.Y
     if grounded==true then
-        airborne=false; rotationDone=false; takeoffUntil=0; restoreAutoRotate()
+        airborne=false; rotationDone=false; takeoffUntil=0; lastHeading=nil; restoreAutoRotate()
     elseif grounded==false then
         -- FloorMaterial can update one frame before upward velocity.
         if wasGrounded==true then takeoffUntil=now+0.2 end
         if not airborne and now<=takeoffUntil and vy>1 then
             airborne=true; rotationDone=false; lastRotation=0; takeoffUntil=0
         end
+    elseif grounded==nil then
+        -- Rotation used velocity in the earlier working version. Ground APIs are
+        -- optional here only; auto receive still requires confirmed ground.
+        if vy>5 and previousJumpVelocity<=5 then
+            airborne=true; rotationDone=false; lastRotation=0; lastHeading=nil
+        elseif vy<=1 then
+            -- Unknown contact: finish at the apex, never guess a landing height.
+            airborne=false; rotationDone=false; restoreAutoRotate()
+        end
     end
+    previousJumpVelocity=vy
     wasGrounded=grounded
-    if not allowed or not cfg.rotation or grounded==nil then
+    if not allowed or not cfg.rotation then
         airborne=false; rotationDone=false; restoreAutoRotate(); return
     end
     if not airborne or (cfg.mode=="Snap" and rotationDone) then return end
     if now-lastRotation<1/30 then return end
     local ok,err=pcall(function()
         local current=root.CFrame
-        assert(current and current.LookVector,"Jump rotation needs BasePart.CFrame support")
-        local p=current.Position or root.Position
+        assert(current,"Jump rotation needs BasePart.CFrame support")
+        local function position()
+            local ok,value=pcall(function() return root.CFrame.Position end)
+            return ok and value or root.Position
+        end
+        local p=position()
         local camera=workspace.CurrentCamera.Position
         local dx,dz=p.X-camera.X,p.Z-camera.Z
         if dx*dx+dz*dz<0.001 then return end
         local angle=math.atan2(dx,dz)+math.pi
-        local heading=math.atan2(-current.LookVector.X,-current.LookVector.Z)
+        local heading=lastHeading
+        -- Some Matcha builds expose a writable frame without LookVector.
+        local readable,look=pcall(function() return current.LookVector end)
+        if readable and look then heading=math.atan2(-look.X,-look.Z) end
+        heading=heading or angle
         local delta=(angle-heading+math.pi)%(2*math.pi)-math.pi
         rotationDone=true
-        if math.abs(delta)<math.rad(2) then return end
+        if (readable and look or lastHeading) and math.abs(delta)<math.rad(2) then return end
         if not rotationHumanoid then
             local h=humanoid()
             if h then pcall(function()
@@ -511,11 +531,11 @@ local function jumpRotation(root,grounded,allowed,now)
         end
         local c,s=math.cos(angle),math.sin(angle)
         -- Read position immediately before the write; never restore old jump position or velocity.
-        local fresh=root.CFrame.Position or root.Position
+        local fresh=position()
         root.CFrame=CFrame.new(fresh.X,fresh.Y,fresh.Z,c,0,s,0,1,0,-s,0,c)
-        local look=root.CFrame.LookVector
-        assert(math.abs(look.X+s)<0.05 and math.abs(look.Z+c)<0.05,"Rotation write not retained")
-        rotationStatus="Rotation write verified ("..cfg.mode..")"
+        -- Reads can lag writes in external runtimes; do not disable on immediate readback.
+        lastHeading=angle
+        rotationStatus="Rotation submitted ("..cfg.mode..")"..(grounded==nil and " | velocity fallback" or "")
         lastRotation=now
     end)
     if not ok then
@@ -693,7 +713,7 @@ local function renderMenu()
     box("window",x,y,w,h,uiColor.bg,100)
     box("accent",x,y,w,3,palettes[cfg.accent],101)
     text("brand","VBL",x+20,y+18,26,palettes[cfg.accent])
-    text("version","SCRIPT / 04",x+82,y+26,12,uiColor.muted)
+    text("version","SCRIPT / 06",x+82,y+26,12,uiColor.muted)
     text("subtitle","COURT CONTROL",x+20,y+62,10,uiColor.muted)
     button("hide","Hide",x+w-158,y+17,66,34,function() opened=false; releaseSet(); pcall(setrobloxinput,true) end)
     button("stop","Stop",x+w-82,y+17,62,34,stop)
@@ -725,6 +745,7 @@ local function renderMenu()
         rowBase("Runtime compatibility","Requires writable BasePart.CFrame; no raw memory writes")
         rowBase("Rotation diagnostics",rotationStatus)
         rowBase("Ground contact",groundStatus)
+        rowBase("Rotation fallback","Without ground APIs: upward motion only; receive stays strict")
     elseif page=="Prediction" then
         toggle("predictor","Ball landing prediction","Estimated path from measured ball motion")
         choice("trajectory","Trajectory style",{"Line","Arrows"})
