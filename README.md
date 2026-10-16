@@ -1,5 +1,16 @@
 # VBL Script
 
+## v5 update
+
+- Ball page now labels the resizer **Ball hitbox extender** and reports verified size writes and failures for live parts and templates. This changes local ball part dimensions; it does not prove the server accepts a larger hit radius. Character receive-part resizing remains available separately.
+- Added **Ball tracker** (marker, distance, measured speed) and **Incoming indicator** (approaching/moving away relative to character motion). These use the same sampled motion as prediction. Approaching is a direction indicator, not a guaranteed collision or enemy attack.
+- Fixed missed jump activation when ground contact changes a frame before upward velocity. The takeoff window expires after 0.2 seconds so a later upward change does not trigger a stale jump.
+- Movement now shows rotation diagnostics and ground-contact status. Rotation writes are read back and checked instead of assuming a successful assignment changed orientation. Errors are also printed with a `[VBL] Jump rotation:` prefix.
+- **Rotation compatibility is still unresolved on Matcha builds without writable BasePart.CFrame.** The inspected original uses old hard-coded memory offsets; those are not verified for the current build and have not been copied. This release is not a claim that rotation now works in every runtime.
+- Simulated regression tests pass, including delayed takeoff, expired takeoff, tracker speed/direction and drawing cleanup. No live game validation was available.
+
+Runtime references reviewed: [Matcha classes](https://huoadf.github.io/matcha-docs/classes/) and [Wabi Matcha classes](https://doc.wabisabi.mom/matcha/classes/). Both list BasePart size/position/velocity, but neither lists BasePart.CFrame. Documentation absence is a compatibility warning, not proof of the capability of a particular installed build.
+
 A standalone Drawing-based GUI with Ball, Character, Movement, Prediction, LOS, Assist, Counter, Match, and Settings pages.
 
 ```lua
