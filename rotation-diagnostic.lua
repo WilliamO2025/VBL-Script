@@ -1,6 +1,6 @@
 -- VBL rotation diagnostic: reads only; never writes game memory or properties.
 -- Saves its report to vbl_rotation_diagnostic.txt when writefile is available.
-local lines={"VBL ROTATION DIAGNOSTIC 1", "Read-only checks; no rotation or input injection."}
+local lines={"VBL ROTATION DIAGNOSTIC 2", "Read-only checks; no rotation or input injection."}
 local function report(s) lines[#lines+1]=s; print("[VBL diagnostic] "..s) end
 local function finite(n) return type(n)=="number" and n==n and math.abs(n)<math.huge end
 local function vector(v)
@@ -14,6 +14,7 @@ local function probe(name,fn)
     report(name..": "..(isVector and string.format("%.3f, %.3f, %.3f",v.X,v.Y,v.Z) or tostring(v)))
     return v
 end
+report("VERSION 2")
 local ok,err=pcall(function()
     if type(identifyexecutor)=="function" then probe("Runtime",function() return identifyexecutor() end) end
     local player=game:GetService("Players").LocalPlayer
@@ -32,52 +33,75 @@ local ok,err=pcall(function()
     report("memory_read exposed: "..tostring(type(memory_read)=="function"))
     report("memory_write exposed: "..tostring(type(memory_write)=="function").." (NOT called)")
     if type(memory_read)~="function" then return end
-    -- Historical source candidates ONLY. A plausible result is not a verified write address.
-    -- No scanning and no pointer values are included in the report.
-    local readOK,primitive=pcall(memory_read,"uintptr_t",root.Address+328)
-    if not readOK then report("Historical pointer read blocked/unavailable"); return end
-    if not finite(primitive) or primitive<65536 or primitive>=2^47 or primitive%8~=0 then
-        report("Historical pointer candidate invalid; no further reads"); return
+    assert(vector(position) and vector(look),"Position/facing unavailable; cannot match a transform")
+    local reads,pointers,matches=0,0,0
+    local function read(kind,address)
+        reads=reads+1
+        assert(reads<=20000,"Read budget reached")
+        return memory_read(kind,address)
     end
-    for _,offset in ipairs({192,264}) do
-        local success,result=pcall(function()
-            local m={}
-            for i=1,9 do
-                m[i]=memory_read("float",primitive+offset+(i-1)*4)
-                assert(finite(m[i]) and math.abs(m[i])<=1.01,"not a rotation matrix")
+    local function pointer(n)
+        return finite(n) and n>=65536 and n<2^47 and n%8==0
+    end
+    local function matrixAt(address,currentLook)
+        local m={}
+        for i=1,9 do
+            m[i]=read("float",address+(i-1)*4)
+            if not finite(m[i]) or math.abs(m[i])>1.01 then return false end
+        end
+        for row=0,2 do
+            local length=0
+            for k=1,3 do length=length+m[row*3+k]^2 end
+            if math.abs(length-1)>0.03 then return false end
+            for other=row+1,2 do
+                local dot=0
+                for k=1,3 do dot=dot+m[row*3+k]*m[other*3+k] end
+                if math.abs(dot)>0.03 then return false end
             end
-            for row=0,2 do
-                local n=0
-                for k=1,3 do n=n+m[row*3+k]^2 end
-                assert(math.abs(n-1)<0.03,"row length invalid")
-                for other=row+1,2 do
-                    local d=0
-                    for k=1,3 do d=d+m[row*3+k]*m[other*3+k] end
-                    assert(math.abs(d)<0.03,"rows not orthogonal")
+        end
+        local determinant=m[1]*(m[5]*m[9]-m[6]*m[8])-m[2]*(m[4]*m[9]-m[6]*m[7])+m[3]*(m[4]*m[8]-m[5]*m[7])
+        return math.abs(determinant-1)<0.05 and
+            math.max(math.abs(m[3]+currentLook.X),math.abs(m[6]+currentLook.Y),math.abs(m[9]+currentLook.Z))<0.03
+    end
+    local oldOK,old=pcall(read,"uintptr_t",root.Address+328)
+    report("Old pointer read: "..(not oldOK and "raised error" or
+        (pointer(old) and "plausible pointer" or ("invalid (type="..type(old)..", zero="..tostring(old==0)..")"))))
+    if not oldOK then report("Memory reads blocked; check Matcha Unsafe Luau setting"); return end
+    report("Bounded read-only search starting; remain still until END")
+    -- Search only pointer slots near this root and a bounded region behind them.
+    -- A matching pose is a candidate, never authorization to write to that address.
+    for pointerOffset=128,768,8 do
+        local ptrOK,base=pcall(read,"uintptr_t",root.Address+pointerOffset)
+        if ptrOK and pointer(base) then
+            pointers=pointers+1
+            local currentPosition=root.Position
+            local currentLook=root.CFrame.LookVector
+            if math.max(math.abs(currentPosition.X-position.X),math.abs(currentPosition.Y-position.Y),math.abs(currentPosition.Z-position.Z))>0.1 then
+                report("Character moved; restart while standing still"); return
+            end
+            for positionOffset=36,768,4 do
+                local success,matched=pcall(function()
+                    local px=read("float",base+positionOffset)
+                    if not finite(px) or math.abs(px-currentPosition.X)>0.05 then return false end
+                    local py=read("float",base+positionOffset+4)
+                    local pz=read("float",base+positionOffset+8)
+                    if not finite(py) or not finite(pz) or math.abs(py-currentPosition.Y)>0.05
+                        or math.abs(pz-currentPosition.Z)>0.05 then return false end
+                    return matrixAt(base+positionOffset-36,currentLook)
+                end)
+                if success and matched then
+                    matches=matches+1
+                    report(string.format("Candidate %d: root pointer +0x%X; rotation +0x%X; position +0x%X; pose matches",
+                        matches,pointerOffset,positionOffset-36,positionOffset))
                 end
+                if reads>=20000 then report("Read budget reached; stopping"); return end
             end
-            local determinant=m[1]*(m[5]*m[9]-m[6]*m[8])-m[2]*(m[4]*m[9]-m[6]*m[7])+m[3]*(m[4]*m[8]-m[5]*m[7])
-            assert(math.abs(determinant-1)<0.05,"determinant invalid")
-            local description="matrix plausible"
-            local compareOK,difference=pcall(function()
-                assert(vector(look))
-                return math.max(math.abs(m[3]+look.X),math.abs(m[6]+look.Y),math.abs(m[9]+look.Z))
-            end)
-            if compareOK then description=description..string.format("; look difference %.4f",difference) end
-            -- Test, do not assume, whether the following floats represent position.
-            local positionOK,distance=pcall(function()
-                assert(vector(position))
-                local px=memory_read("float",primitive+offset+36)
-                local py=memory_read("float",primitive+offset+40)
-                local pz=memory_read("float",primitive+offset+44)
-                assert(finite(px) and finite(py) and finite(pz))
-                return math.sqrt((px-position.X)^2+(py-position.Y)^2+(pz-position.Z)^2)
-            end)
-            if positionOK then description=description..string.format("; adjacent position difference %.3f",distance) end
-            return description
-        end)
-        report("Historical matrix "..offset..": "..(success and result or "not validated"))
+        end
+        if task and type(task.wait)=="function" then task.wait() end
     end
+    report(string.format("Search complete: %d plausible pointers, %d reads, %d pose candidates",pointers,reads,matches))
+    if pointers==0 then report("No readable pointers: memory access may be disabled or this layout differs") end
+    if matches>0 then report("Pose matches are NOT verified write targets; movement correlation is still needed") end
 end)
 if not ok then report("Check stopped: "..tostring(err)) end
 report("END. Readability does not prove writability. No game state changed.")
