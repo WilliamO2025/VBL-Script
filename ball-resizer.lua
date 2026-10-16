@@ -16,24 +16,27 @@ local defaults = {
     menuKey = 0x70, accent = "Violet", predictionColor = "Cyan",
     teamColor = "Green", enemyColor = "Rose",
     receiveHitbox = false, receiveScale = 1.5,
+    receiveAction = "Set", counter = false, counterKey = 0x45,
+    counterReach = 4, counterSpeed = 25, counterLead = 40,
 }
 local limits = {
     size={0.1,30}, segments={3,24}, marker={4,40}, gravity={1,200}, ground={-100,100},
     length={3,30}, thickness={1,6}, setDistance={1,20}, cooldown={0.2,2},
     menuKey={8,255}, setKey={8,255}, receiveScale={1,5},
+    counterKey={8,255}, counterReach={1,10}, counterSpeed={5,150}, counterLead={0,150},
 }
 local palettes = {
     Violet=Color3.fromRGB(167,139,250), Cyan=Color3.fromRGB(65,210,230),
     Green=Color3.fromRGB(79,222,155), Rose=Color3.fromRGB(251,113,133),
 }
-local options = {mode={"Snap","Free"}, trajectory={"Line","Arrows"}}
+local options = {mode={"Snap","Free"}, trajectory={"Line","Arrows"}, receiveAction={"Set","Bump"}}
 local cfg = {}
 local function valid(key, value)
     if type(value) ~= type(defaults[key]) then return false end
     if type(value) == "number" then
         local range = limits[key]
         return value == value and range and value >= range[1] and value <= range[2]
-            and ((key ~= "menuKey" and key ~= "setKey" and key ~= "segments") or value % 1 == 0)
+            and ((key ~= "menuKey" and key ~= "setKey" and key ~= "counterKey" and key ~= "segments") or value % 1 == 0)
     end
     if type(value) == "string" then
         if options[key] then
@@ -81,6 +84,8 @@ local receiveOriginals, receiveTargets = {},{}
 local groundStatus = "Checking ground contact"
 local setHeld, releaseAt, nextSet = false,0,0
 local keyHeldCode = nil
+local mouseHeld, inputMode = false,nil
+local assistBalls, motion = {},{}
 local uiColor = {bg=Color3.fromRGB(15,18,27), panel=Color3.fromRGB(23,28,40),
     line=Color3.fromRGB(41,48,65), text=Color3.fromRGB(235,239,249), muted=Color3.fromRGB(145,156,177)}
 local function save()
@@ -100,6 +105,8 @@ local function keyName(code)
 end
 local function releaseSet()
     if setHeld and keyHeldCode then pcall(keyrelease,keyHeldCode) end
+    if mouseHeld then pcall(mouse1release) end
+    mouseHeld=false; inputMode=nil
     setHeld=false; keyHeldCode=nil
 end
 local function restoreSizes()
@@ -304,16 +311,19 @@ local function updateReceiveHitbox()
     end
 end
 local function collectBalls()
-    local found={}
+    local found,representatives={},{}
     for _,model in ipairs(workspace:GetChildren()) do
         -- CLIENT_BALL_ is 12 characters. This is the source script's live-ball selector.
         if model:IsA("Model") and model.Name:sub(1,12)=="CLIENT_BALL_" and not model:FindFirstChildOfClass("Humanoid") then
+            local first=nil
             for _,part in ipairs(model:GetDescendants()) do
-                if part:IsA("BasePart") then table.insert(found,part) end
+                if part:IsA("BasePart") then table.insert(found,part); if not first or part.Address<first.Address then first=part end end
             end
+            if first then table.insert(representatives,first) end
         end
     end
     balls=found
+    assistBalls=representatives
 end
 local function resizePart(part)
     local id=part.Address
@@ -469,22 +479,79 @@ local function jumpRotation(root,grounded,allowed,now)
         status="Jump rotation unavailable: this runtime lacks writable BasePart.CFrame"
     end
 end
-local function autoSet(now,root,active,grounded)
-    local ready=canReceive(root,grounded)
-    if setHeld and (now>=releaseAt or not active or opened or not cfg.autoSet or not ready) then releaseSet() end
-    if not active or opened or not ready or not cfg.autoSet or setHeld or now<nextSet then return end
-    if type(keypress)~="function" or type(keyrelease)~="function" then
-        set("autoSet",false); status="Auto set unavailable: input API missing"; return
+local function dot(a,b) return a.X*b.X+a.Y*b.Y+a.Z*b.Z end
+local function trackApproaches(now,root,active)
+    local seenBalls={}
+    for _,ball in ipairs(assistBalls) do
+        pcall(function()
+            local id=ball.Address
+            seenBalls[id]=true
+            local m=motion[id] or {fired=false,stable=0}
+            local p=ball.Position
+            local dt=m.t and now-m.t or 0
+            local v=dt>=0.005 and dt<=0.15 and (p-m.p)/dt or nil
+            local previous=m.v
+            m.stable=v and previous and (v-previous).Magnitude<80 and m.stable+1 or 0
+            m.v=v; m.p=p; m.t=now
+            if not active or not root or not v or v.Magnitude>350 then
+                m.v=nil; m.stable=0
+            elseif (p-root.Position).Magnitude>math.max(cfg.setDistance,cfg.counterReach)+6
+                and dot(p-root.Position,v-root.Velocity)>0 then
+                -- Rearm only after the same ball has left the interaction area.
+                m.fired=false
+            end
+            motion[id]=m
+        end)
     end
-    local closest=math.huge
-    for _,ball in ipairs(balls) do pcall(function() closest=math.min(closest,(ball.Position-root.Position).Magnitude) end) end
-    if closest<=cfg.setDistance then
-        -- Never release a physical key that the user was already holding.
-        if iskeypressed(cfg.setKey) then return end
-        keyHeldCode=cfg.setKey; setHeld=true
-        local ok=pcall(keypress,keyHeldCode)
-        if not ok then releaseSet(); status="Auto set input failed"; return end
-        releaseAt=now+0.06; nextSet=now+cfg.cooldown
+    for id in pairs(motion) do if not seenBalls[id] then motion[id]=nil end end
+end
+local function autoSet(now,root,active,grounded)
+    local receiving=cfg.autoSet and canReceive(root,grounded)
+    local countering=cfg.counter and root and grounded==false and iskeypressed(cfg.counterKey)
+    if setHeld and (now>=releaseAt or not active or opened
+        or (inputMode=="Receive" and not receiving) or (inputMode=="Counter" and not countering)) then releaseSet() end
+    if not active or opened or not root or setHeld or now<nextSet then return end
+    if not receiving and not countering then return end
+    local reach=countering and cfg.counterReach or cfg.setDistance
+    local target=root.Position+Vector3.new(0,countering and 2 or 0,0)
+    local lead=countering and cfg.counterLead/1000 or 0
+    for _,ball in ipairs(assistBalls) do
+        local m=motion[ball.Address]
+        if m and m.t==now and m.v and m.stable>=2 and not m.fired then
+            local r=m.p-target
+            local v=m.v-root.Velocity
+            local speed=v.Magnitude
+            local approach=-dot(r,v)
+            local t=speed>0 and approach/(speed*speed) or -1
+            local closest=t>=0 and (r+v*t).Magnitude or math.huge
+            -- Reject outgoing, stationary, glancing and stale tracks. No queued blind click.
+            local inWindow=(r+v*lead).Magnitude<=reach
+            local height=m.p.Y-root.Position.Y
+            if speed>=(countering and cfg.counterSpeed or 2) and approach>0 and t<=0.35
+                and closest<=reach*0.65 and inWindow
+                and (not countering or (height>=0.5 and height<=7)) then
+                local useMouse=countering or cfg.receiveAction=="Bump"
+                if useMouse then
+                    if ismouse1pressed() then return end
+                    if type(mouse1press)~="function" or type(mouse1release)~="function" then
+                        status="Mouse assist unavailable: mouse input API missing"; return
+                    end
+                    mouseHeld=true; setHeld=true
+                    if not pcall(mouse1press) then releaseSet(); status="Mouse input failed"; return end
+                else
+                    if iskeypressed(cfg.setKey) then return end
+                    if type(keypress)~="function" or type(keyrelease)~="function" then
+                        status="Set unavailable: keyboard input API missing"; return
+                    end
+                    keyHeldCode=cfg.setKey; setHeld=true
+                    if not pcall(keypress,keyHeldCode) then releaseSet(); status="Set input failed"; return end
+                end
+                inputMode=countering and "Counter" or "Receive"
+                m.fired=true; releaseAt=now+0.04; nextSet=now+cfg.cooldown
+                status=inputMode.." triggered once for incoming ball"
+                return
+            end
+        end
     end
 end
 local function renderMenu()
@@ -501,9 +568,9 @@ local function renderMenu()
     button("hide","Hide",x+w-158,y+17,66,34,function() opened=false; releaseSet(); pcall(setrobloxinput,true) end)
     button("stop","Stop",x+w-82,y+17,62,34,stop)
     if not running then return end
-    local pages={"Ball","Character","Movement","Prediction","LOS","Assist","Settings"}
+    local pages={"Ball","Character","Movement","Prediction","LOS","Assist","Counter","Settings"}
     for i,name in ipairs(pages) do
-        button("nav"..name,name,x+16,y+99+(i-1)*47,140,38,function() page=name; sliderDrag=nil end,page==name)
+        button("nav"..name,name,x+16,y+99+(i-1)*41,140,38,function() page=name; sliderDrag=nil end,page==name)
     end
     text("pagetitle",page,x+183,y+67,20)
     row=0
@@ -538,12 +605,18 @@ local function renderMenu()
         slider("length","Direction length",3,30,1," studs")
         slider("thickness","Line thickness",1,6,1," px")
     elseif page=="Assist" then
-        toggle("autoSet","Auto set / receive","Ground contact required; no mid-air receives")
+        toggle("autoSet","Auto receive",groundStatus)
+        choice("receiveAction","Action: Set / Bump",{"Set","Bump"})
         slider("setDistance","Trigger distance",1,20,0.5," studs")
         slider("cooldown","Input cooldown",0.2,2,0.1," sec")
-        keybind("setKey","Set / receive key")
-        rowBase("Focus protection","Paused while this menu is open or Roblox is unfocused")
-        rowBase("Ground contact",groundStatus)
+        keybind("setKey","Set key (Bump uses left click)")
+    elseif page=="Counter" then
+        toggle("counter","Counter-spike assist (experimental)","Jump + hold arm key; aim manually")
+        keybind("counterKey","Hold to arm counter")
+        slider("counterReach","Counter reach",1,10,0.5," studs")
+        slider("counterSpeed","Minimum incoming speed",5,150,1," studs/s")
+        slider("counterLead","Prediction lead",0,150,5," ms")
+        rowBase("Timing is estimated","No enemy-hit detection or guaranteed perfect timing")
     else
         keybind("menuKey","Menu toggle key")
         choice("accent","Menu accent",{"Violet","Cyan","Green","Rose"})
@@ -605,6 +678,7 @@ local function frame()
         renderMenu()
     end
     if not running then return end
+    trackApproaches(now,root,active and not opened)
     autoSet(now,root,active,grounded)
     for id,d in pairs(draws) do
         if not seen[id] then d:Remove(); draws[id]=nil end
@@ -627,4 +701,3 @@ task.spawn(function()
 end)
 -- Local test seam / useful handle for runtimes that retain loadstring return values.
 return {Stop=stop,Settings=cfg,Set=set,Frame=frame,LandingTime=landingTime,Grounded=isGrounded}
-
