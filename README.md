@@ -1,6 +1,12 @@
 # VBL Script
 
-## v5 update
+## v6 rotation regression fix
+
+The earlier saved working implementation (`work/published-v3.lua`) used a writable CFrame and upward velocity, without requiring ground APIs or a readable LookVector. Later changes introduced those extra requirements. v6 removes that regression: when contact is unavailable, rotation activates on upward velocity crossing 5 studs/s and stops at the apex. Auto receive still requires verified ground contact. Snap writes once; Free remains rate limited. Missing frame Position/LookVector members are tolerated, and immediate readback no longer disables rotation because external reads may lag. Existing saved OFF settings are preserved: enable Jump rotation after reloading. The menu shows SCRIPT / 06.
+
+Simulated tests cover unavailable ground APIs and frame members, one-shot Snap, apex cleanup and no falling writes. In-game verification is still needed. The CFrame property itself must remain writable, as in the earlier implementation.
+
+## v5 update (historical)
 
 - Ball page now labels the resizer **Ball hitbox extender** and reports verified size writes and failures for live parts and templates. This changes local ball part dimensions; it does not prove the server accepts a larger hit radius. Character receive-part resizing remains available separately.
 - Added **Ball tracker** (marker, distance, measured speed) and **Incoming indicator** (approaching/moving away relative to character motion). These use the same sampled motion as prediction. Approaching is a direction indicator, not a guaranteed collision or enemy attack.
@@ -25,7 +31,7 @@ The menu leaves game input enabled, so you can move your character and interact 
 
 - Ball resizing: 0.1–30 studs; updates live `CLIENT_BALL_` models and replicated ball templates. Disabling or stopping restores recorded sizes where the parts still exist.
 - Character receive-hitbox resizer: scales identified `ReceiveHitbox`, `ReceiverHitbox`, `ReceivingHitbox`, `BumpHitbox`, or `Hitbox` parts directly under Receive/Receiving/Bump containers inside your character. The Character page reports how many were found. Scaling is relative to the original size, from 1x to 5x; disable or Stop restores it. This does not resize body parts or create a receive mechanism. If the game exposes no such part, resizing is unavailable. Server-calculated receive range may remain unchanged.
-- Jump rotation: Snap once per grounded-to-airborne takeoff, or rate-limited Free turns while airborne, facing away from the camera. Landing, losing focus, opening the menu, disabling rotation, and Stop restore the humanoid's original AutoRotate value when that property is supported. Rotation uses freshly read frame position and never writes velocity. **Requires writable `BasePart.CFrame` and ground-contact detection. In-game behavior remains unverified.**
+- Jump rotation: Snap once per grounded-to-airborne takeoff, or rate-limited Free turns while airborne, facing away from the camera. Landing, losing focus, opening the menu, disabling rotation, and Stop restore the humanoid's original AutoRotate value when that property is supported. Rotation uses freshly read frame position and never writes velocity. **Requires writable `BasePart.CFrame`. When ground detection is unavailable, rotation uses upward velocity and finishes at the apex; auto receive does not use that fallback. In-game behavior remains unverified.**
 - Ball prediction: estimates landing from sampled motion, configurable gravity and court-floor Y, line or arrow trajectories, and a landing circle. Defaults of gravity 17 and floor Y -5 come from the older original source; adjust for the current game. Predictions ignore bounces and special ability changes.
 - LOS: local, teammate, and opponent facing arrows, with configurable length, thickness, and colors. As in the older source, this means facing direction, not a wall-occlusion test. **Requires readable `BasePart.CFrame`; unsupported runtimes show a message.**
 - Auto receive: grounded only. Fresh installs default to **Bump (left click)**; **Set (Q/custom key)** is also available. Existing saved action choices are preserved. The default **Serves / spikes** filter requires a resolved opposing last hitter and either a likely serve or a fast non-rising attack. **Enemy returns** also permits softer opposing returns. Your own and teammate touches never trigger it. Ground contact uses FloorMaterial or the filtered foot probe; unknown contact pauses receiving.
