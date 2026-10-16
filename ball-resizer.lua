@@ -1,4 +1,4 @@
--- VBL Script v3: readable, standalone Matcha drawing GUI.
+-- VBL Script v4: readable, standalone Matcha drawing GUI.
 -- Feature reference: 0x1cx/random-lua revision a46fe389 (April 3 2026).
 -- Resizer behavior also based on Luna7070/585438 v1.2/v2.0. Original hitbox credit: huss.
 -- No remote code, memory offsets, or executable config files.
@@ -6,6 +6,7 @@
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 local Http = game:GetService("HttpService")
+local Replicated = game:GetService("ReplicatedStorage")
 local CONFIG = "vbl_script_config.json"
 local defaults = {
     size = 5.5, resize = false, rotation = false, mode = "Snap",
@@ -16,25 +17,28 @@ local defaults = {
     menuKey = 0x70, accent = "Violet", predictionColor = "Cyan",
     teamColor = "Green", enemyColor = "Rose",
     receiveHitbox = false, receiveScale = 1.5,
-    receiveAction = "Set", counter = false, counterKey = 0x45,
+    receiveAction = "Bump", counter = false, counterKey = 0x45,
     counterReach = 4, counterSpeed = 25, counterLead = 40,
+    counterMode = "Always", receiveFilter = "Serves / spikes", attackSpeed = 25,
 }
 local limits = {
     size={0.1,30}, segments={3,24}, marker={4,40}, gravity={1,200}, ground={-100,100},
     length={3,30}, thickness={1,6}, setDistance={1,20}, cooldown={0.2,2},
-    menuKey={8,255}, setKey={8,255}, receiveScale={1,5},
-    counterKey={8,255}, counterReach={1,10}, counterSpeed={5,150}, counterLead={0,150},
+    menuKey={5,255}, setKey={5,255}, receiveScale={1,5},
+    counterKey={5,255}, attackSpeed={5,150}, counterReach={1,10}, counterSpeed={5,150}, counterLead={0,150},
 }
 local palettes = {
     Violet=Color3.fromRGB(167,139,250), Cyan=Color3.fromRGB(65,210,230),
     Green=Color3.fromRGB(79,222,155), Rose=Color3.fromRGB(251,113,133),
 }
-local options = {mode={"Snap","Free"}, trajectory={"Line","Arrows"}, receiveAction={"Set","Bump"}}
+local options = {mode={"Snap","Free"}, trajectory={"Line","Arrows"}, receiveAction={"Set","Bump"},
+    counterMode={"Always","Toggle","Hold"}, receiveFilter={"Serves / spikes","Enemy returns"}}
 local cfg = {}
 local function valid(key, value)
     if type(value) ~= type(defaults[key]) then return false end
     if type(value) == "number" then
         local range = limits[key]
+        if (key=="menuKey" or key=="setKey" or key=="counterKey") and (value==7 or value%1~=0) then return false end
         return value == value and range and value >= range[1] and value <= range[2]
             and ((key ~= "menuKey" and key ~= "setKey" and key ~= "counterKey" and key ~= "segments") or value % 1 == 0)
     end
@@ -71,9 +75,9 @@ end)
 local running, opened, page = true, true, "Ball"
 local status, saveStatus = "Ready | Features start with their saved settings", "Config loaded"
 local dirtyAt, savedAt = nil, 0
-local originals, samples, balls = {}, {}, {}
+local originals, balls = {}, {}
 local draws, seen = {}, {}
-local x,y,w,h = 110,100,700,505
+local x,y,w,h = 110,100,700,565
 local mouseX,mouseY,clicked,held = 0,0,false,false
 local previousKeys, dragging, sliderDrag, binding = {}, nil,nil,nil
 local lastMouse, lastScan, lastResize = false,-100,-100
@@ -86,6 +90,9 @@ local setHeld, releaseAt, nextSet = false,0,0
 local keyHeldCode = nil
 local mouseHeld, inputMode = false,nil
 local assistBalls, motion = {},{}
+local match = {gate="Waiting for ball data"}
+local trackedRoot=nil
+local serveState={}
 local uiColor = {bg=Color3.fromRGB(15,18,27), panel=Color3.fromRGB(23,28,40),
     line=Color3.fromRGB(41,48,65), text=Color3.fromRGB(235,239,249), muted=Color3.fromRGB(145,156,177)}
 local function save()
@@ -101,7 +108,7 @@ end
 local function keyName(code)
     if code>=0x70 and code<=0x7B then return "F"..(code-0x6F) end
     if code>=48 and code<=90 then return string.char(code) end
-    return ({[0x24]="Home",[0x2D]="Insert",[0x2E]="Delete",[0x20]="Space"})[code] or tostring(code)
+    return ({[5]="Mouse 4",[6]="Mouse 5",[0x24]="Home",[0x2D]="Insert",[0x2E]="Delete",[0x20]="Space"})[code] or tostring(code)
 end
 local function releaseSet()
     if setHeld and keyHeldCode then pcall(keyrelease,keyHeldCode) end
@@ -178,7 +185,7 @@ local function toggle(key,title,description)
         set(key,not cfg[key])
         if key=="resize" and not cfg.resize then restoreSizes() end
         if key=="receiveHitbox" and not cfg.receiveHitbox then restoreReceiveHitbox() end
-        if key=="autoSet" and not cfg.autoSet then releaseSet() end
+        if (key=="autoSet" or key=="counter") and not cfg[key] then releaseSet() end
     end,cfg[key])
 end
 local function choice(key,title,values)
@@ -204,7 +211,7 @@ local function slider(key,title,minimum,maximum,step,unit)
     end
 end
 local function keybind(key,title)
-    local ry=rowBase(title,binding==key and "Press a key; Escape cancels" or keyName(cfg[key]))
+    local ry=rowBase(title,binding==key and "Press key or side button; Escape cancels" or keyName(cfg[key]))
     button("bind"..key,"Rebind",x+w-114,ry+8,82,35,function() binding=key end)
 end
 local function rootPart(player)
@@ -370,26 +377,21 @@ local function landingTime(height,vy,gravity)
     if height<=0 then return 0 end
     return (vy+math.sqrt(vy*vy+2*gravity*height))/gravity
 end
+local function trajectoryAt(p,v,t)
+    return p+v*t+Vector3.new(0,-0.5*cfg.gravity*t*t,0)
+end
 local function prediction(now)
-    local active={}
-    for _,ball in ipairs(balls) do
+    if not cfg.predictor then return end
+    for _,ball in ipairs(assistBalls) do
         pcall(function()
             local id=ball.Address
-            active[id]=true
-            local p=ball.Position
-            local old=samples[id]
-            samples[id]={p=p,t=now}
-            if not cfg.predictor or not old then return end
-            local dt=now-old.t
-            if dt<0.005 or dt>0.3 then return end
-            local v=(p-old.p)/dt
-            if v.Magnitude<1 or v.Magnitude>350 then return end
+            local m=motion[id]
+            if not m or m.t~=now or not m.v or m.v.Magnitude<1 then return end
+            local p,v=m.p,m.v
             local duration=landingTime(p.Y-cfg.ground,v.Y,cfg.gravity)
             if duration<=0 or duration>15 then return end
             local color=palettes[cfg.predictionColor]
-            local function at(t)
-                return Vector3.new(p.X+v.X*t,p.Y+v.Y*t-0.5*cfg.gravity*t*t,p.Z+v.Z*t)
-            end
+            local function at(t) return trajectoryAt(p,v,t) end
             local landing=project(at(duration))
             if landing then
                 draw("landing"..id,"Circle",{Position=landing,Radius=cfg.marker,NumSides=32,
@@ -403,7 +405,6 @@ local function prediction(now)
             end
         end)
     end
-    for id in pairs(samples) do if not active[id] then samples[id]=nil end end
 end
 local function facingLines()
     if not cfg.los then return end
@@ -480,55 +481,137 @@ local function jumpRotation(root,grounded,allowed,now)
     end
 end
 local function dot(a,b) return a.X*b.X+a.Y*b.Y+a.Z*b.Z end
+local function attribute(object,name)
+    local ok,value=pcall(function() return object:GetAttribute(name) end)
+    if ok and (type(value)=="string" or type(value)=="number") and tostring(value)~="" and value~=0 then return value end
+end
+local function playerFor(value)
+    if not value then return nil end
+    for _,player in ipairs(Players:GetPlayers()) do
+        local ok,found=pcall(function()
+            local id=tonumber(value)
+            return tostring(value)==player.Name or (id~=nil and id==player.UserId)
+        end)
+        if ok and found then return player end
+    end
+end
+local function teamFor(player)
+    if not player then return nil end
+    local ok,name=pcall(function() return player.Team and player.Team.Name end)
+    if ok and type(name)=="string" and name~="" then return name end
+    -- This fallback path is present in the statically inspected older VBL source.
+    ok,name=pcall(function()
+        local info=Replicated:FindFirstChild("PlayerInfo")
+        local record=info and info:FindFirstChild(player.Name)
+        local team=record and record:FindFirstChild("Team")
+        return team and team.Value
+    end)
+    if ok and type(name)=="string" and name~="" then return name end
+end
+local function readMatch()
+    local hitter=attribute(Replicated,"LastHitter")
+    local server=attribute(Replicated,"ServedByPlayer")
+    local player=playerFor(hitter)
+    local team=teamFor(player)
+    local ownTeam=teamFor(LocalPlayer)
+    local ownName=LocalPlayer.Name
+    match={hitter=hitter,server=server,player=player,team=team,ownTeam=ownTeam,
+        gate="Ready",shot="Unknown",source="ReplicatedStorage attributes"}
+    if #assistBalls~=1 then match.gate="Paused: global hit data requires one live ball"
+    elseif not hitter or not player then match.gate="Paused: LastHitter unresolved"
+    elseif not team or not ownTeam then match.gate="Paused: team data unavailable"
+    elseif player.Name==ownName or team==ownTeam then match.gate="Ignored: your team's last touch"
+    else match.enemy=true end
+    local servingPlayer=playerFor(server)
+    local ballID=#assistBalls==1 and assistBalls[1].Address or nil
+    local serverName=servingPlayer and servingPlayer.Name or server
+    if serveState.server~=serverName or serveState.ball~=ballID then
+        serveState={server=serverName,ball=ballID,returned=false}
+    end
+    if player and servingPlayer and player.Name~=servingPlayer.Name then serveState.returned=true end
+    match.serve=match.enemy and not serveState.returned and servingPlayer and player
+        and servingPlayer.Name==player.Name or false
+end
 local function trackApproaches(now,root,active)
+    local rootID=root and root.Address
+    if trackedRoot~=rootID then motion={}; trackedRoot=rootID end
+    readMatch()
     local seenBalls={}
     for _,ball in ipairs(assistBalls) do
         pcall(function()
             local id=ball.Address
             seenBalls[id]=true
-            local m=motion[id] or {fired=false,stable=0}
+            local m=motion[id] or {fired=false}
             local p=ball.Position
             local dt=m.t and now-m.t or 0
-            local v=dt>=0.005 and dt<=0.15 and (p-m.p)/dt or nil
-            local previous=m.v
-            m.stable=v and previous and (v-previous).Magnitude<80 and m.stable+1 or 0
-            m.v=v; m.p=p; m.t=now
-            if not active or not root or not v or v.Magnitude>350 then
-                m.v=nil; m.stable=0
-            elseif (p-root.Position).Magnitude>math.max(cfg.setDistance,cfg.counterReach)+6
-                and dot(p-root.Position,v-root.Velocity)>0 then
-                -- Rearm only after the same ball has left the interaction area.
-                m.fired=false
+            local v=dt>=0.003 and dt<=0.12 and (p-m.p)/dt or nil
+            if v and (v.Magnitude~=v.Magnitude or v.Magnitude>600) then v=nil end
+            -- A new verified hitter or serve can rearm even during a rapid close rally.
+            local token=tostring(match.player and match.player.Name or match.hitter)..":"..tostring(match.server)
+            if m.token~=token then m.fired=false end
+            m.token=token
+            m.ready=active and m.active and v~=nil
+            m.active=active; m.v=v; m.p=p; m.t=now; m.dt=dt
+            if match.enemy and v then
+                match.shot=match.serve and "Likely serve (inferred)" or
+                    ((v.Magnitude>=cfg.attackSpeed and v.Y<=3) and "Fast attack (inferred)" or "Other enemy return")
             end
+            if root and v and (p-root.Position).Magnitude>math.max(cfg.setDistance,cfg.counterReach)+6
+                and dot(p-root.Position,v-root.Velocity)>0 then m.fired=false end
             motion[id]=m
         end)
     end
     for id in pairs(motion) do if not seenBalls[id] then motion[id]=nil end end
 end
+local function contactTime(r,v,reach,horizon)
+    local speed2=dot(v,v)
+    if speed2<0.01 or dot(r,v)>=0 then return nil end
+    -- Closest point on the same ballistic path used by the visible predictor.
+    local t=math.max(0,math.min(horizon,-dot(r,v)/speed2))
+    local acceleration=Vector3.new(0,-cfg.gravity,0)
+    for _=1,4 do
+        local q=trajectoryAt(r,v,t)
+        local tangent=v+acceleration*t
+        local denominator=dot(tangent,tangent)+dot(q,acceleration)
+        if denominator<=0.001 then break end
+        t=math.max(0,math.min(horizon,t-dot(q,tangent)/denominator))
+    end
+    if trajectoryAt(r,v,t).Magnitude>reach*0.85 then return nil end
+    if r.Magnitude<=reach then return 0 end
+    local lo,hi=0,t
+    for _=1,12 do
+        local mid=(lo+hi)/2
+        if trajectoryAt(r,v,mid).Magnitude<=reach then hi=mid else lo=mid end
+    end
+    return hi
+end
 local function autoSet(now,root,active,grounded)
     local receiving=cfg.autoSet and canReceive(root,grounded)
-    local countering=cfg.counter and root and grounded==false and iskeypressed(cfg.counterKey)
-    if setHeld and (now>=releaseAt or not active or opened
+    local countering=cfg.counter and root and grounded==false
+        and (cfg.counterMode~="Hold" or iskeypressed(cfg.counterKey))
+    if setHeld and (now>=releaseAt or not active or opened or not match.enemy
         or (inputMode=="Receive" and not receiving) or (inputMode=="Counter" and not countering)) then releaseSet() end
-    if not active or opened or not root or setHeld or now<nextSet then return end
+    if not active or opened or not root or setHeld then return end
     if not receiving and not countering then return end
+    if not match.enemy then return end
+    if not countering and now<nextSet then return end
     local reach=countering and cfg.counterReach or cfg.setDistance
     local target=root.Position+Vector3.new(0,countering and 2 or 0,0)
     local lead=countering and cfg.counterLead/1000 or 0
     for _,ball in ipairs(assistBalls) do
         local m=motion[ball.Address]
-        if m and m.t==now and m.v and m.stable>=2 and not m.fired then
+        if m and m.t==now and m.v and m.ready and not m.fired then
             local r=m.p-target
             local v=m.v-root.Velocity
-            local speed=v.Magnitude
-            local approach=-dot(r,v)
-            local t=speed>0 and approach/(speed*speed) or -1
-            local closest=t>=0 and (r+v*t).Magnitude or math.huge
-            -- Reject outgoing, stationary, glancing and stale tracks. No queued blind click.
-            local inWindow=(r+v*lead).Magnitude<=reach
+            local speed=m.v.Magnitude
+            local spike=speed>=cfg.attackSpeed and m.v.Y<=3
+            local eligible=countering and spike and not match.serve or (not countering and
+                (cfg.receiveFilter=="Enemy returns" or match.serve or spike))
+            match.shot=match.serve and "Likely serve (inferred)" or (spike and "Fast attack (inferred)" or "Other enemy return")
+            local horizon=math.min(0.18,lead+math.min(m.dt,0.04))
+            local eta=eligible and contactTime(r,v,reach,horizon) or nil
             local height=m.p.Y-root.Position.Y
-            if speed>=(countering and cfg.counterSpeed or 2) and approach>0 and t<=0.35
-                and closest<=reach*0.65 and inWindow
+            if eta and speed>=(countering and cfg.counterSpeed or 2)
                 and (not countering or (height>=0.5 and height<=7)) then
                 local useMouse=countering or cfg.receiveAction=="Bump"
                 if useMouse then
@@ -547,8 +630,9 @@ local function autoSet(now,root,active,grounded)
                     if not pcall(keypress,keyHeldCode) then releaseSet(); status="Set input failed"; return end
                 end
                 inputMode=countering and "Counter" or "Receive"
-                m.fired=true; releaseAt=now+0.04; nextSet=now+cfg.cooldown
-                status=inputMode.." triggered once for incoming ball"
+                m.fired=true; releaseAt=now+(countering and 0.016 or 0.04)
+                if not countering then nextSet=now+cfg.cooldown end
+                status=inputMode.." | "..tostring(match.hitter).." | "..match.shot
                 return
             end
         end
@@ -563,14 +647,14 @@ local function renderMenu()
     box("window",x,y,w,h,uiColor.bg,100)
     box("accent",x,y,w,3,palettes[cfg.accent],101)
     text("brand","VBL",x+20,y+18,26,palettes[cfg.accent])
-    text("version","SCRIPT / 03",x+82,y+26,12,uiColor.muted)
+    text("version","SCRIPT / 04",x+82,y+26,12,uiColor.muted)
     text("subtitle","COURT CONTROL",x+20,y+62,10,uiColor.muted)
     button("hide","Hide",x+w-158,y+17,66,34,function() opened=false; releaseSet(); pcall(setrobloxinput,true) end)
     button("stop","Stop",x+w-82,y+17,62,34,stop)
     if not running then return end
-    local pages={"Ball","Character","Movement","Prediction","LOS","Assist","Counter","Settings"}
+    local pages={"Ball","Character","Movement","Prediction","LOS","Assist","Counter","Match","Settings"}
     for i,name in ipairs(pages) do
-        button("nav"..name,name,x+16,y+99+(i-1)*41,140,38,function() page=name; sliderDrag=nil end,page==name)
+        button("nav"..name,name,x+16,y+99+(i-1)*47,140,38,function() page=name; sliderDrag=nil end,page==name)
     end
     text("pagetitle",page,x+183,y+67,20)
     row=0
@@ -610,13 +694,24 @@ local function renderMenu()
         slider("setDistance","Trigger distance",1,20,0.5," studs")
         slider("cooldown","Input cooldown",0.2,2,0.1," sec")
         keybind("setKey","Set key (Bump uses left click)")
+        choice("receiveFilter","Receive filter",{"Serves / spikes","Enemy returns"})
+        rowBase("Defense status",match.gate)
     elseif page=="Counter" then
-        toggle("counter","Counter-spike assist (experimental)","Jump + hold arm key; aim manually")
-        keybind("counterKey","Hold to arm counter")
+        toggle("counter","Counter-spike assist", "Airborne + enemy fast attack; aim manually")
+        choice("counterMode","Activation",{"Always","Toggle","Hold"})
+        keybind("counterKey","Counter toggle / hold key")
         slider("counterReach","Counter reach",1,10,0.5," studs")
         slider("counterSpeed","Minimum incoming speed",5,150,1," studs/s")
         slider("counterLead","Prediction lead",0,150,5," ms")
-        rowBase("Timing is estimated","No enemy-hit detection or guaranteed perfect timing")
+        rowBase("Defense status",match.gate)
+    elseif page=="Match" then
+        rowBase("Your team",match.ownTeam or "Unavailable")
+        rowBase("Last hitter",tostring(match.hitter or "Unavailable"))
+        rowBase("Last hitter team",match.team or "Unavailable")
+        rowBase("Server",tostring(match.server or "Unavailable"))
+        rowBase("Shot estimate",match.shot)
+        slider("attackSpeed","Fast attack minimum speed",5,150,1," studs/s")
+        rowBase("Defense status",match.gate)
     else
         keybind("menuKey","Menu toggle key")
         choice("accent","Menu accent",{"Violet","Cyan","Green","Rose"})
@@ -639,7 +734,7 @@ local function frame()
     local active=isrbxactive()
     seen={}
     local keyEdges={}
-    for code=8,255 do
+    for code=5,255 do
         local pressed=iskeypressed(code)
         keyEdges[code]=pressed and not previousKeys[code]
         previousKeys[code]=pressed
@@ -652,7 +747,7 @@ local function frame()
     if not held then dragging=nil; sliderDrag=nil end
     if active then
         if binding then
-            for code=8,255 do
+            for code=5,255 do
                 if keyEdges[code] then
                     if code~=0x1B then set(binding,code) end
                     binding=nil; break
@@ -662,23 +757,27 @@ local function frame()
             opened=not opened; dragging=nil; sliderDrag=nil
             releaseSet(); pcall(setrobloxinput,true)
         end
+        if not binding and not opened and cfg.counterMode=="Toggle" and keyEdges[cfg.counterKey]
+            and cfg.counterKey~=cfg.menuKey then
+            set("counter",not cfg.counter); releaseSet()
+        end
         if opened and clicked and over(x,y+3,w-180,52) then dragging={mouseX-x,mouseY-y} end
         if dragging and held then x=math.max(0,mouseX-dragging[1]); y=math.max(0,mouseY-dragging[2]) end
     else
         dragging=nil; sliderDrag=nil; binding=nil
         releaseSet()
     end
-    if now-lastScan>=0.5 then collectBalls(); lastScan=now end
+    if now-lastScan>=0.1 then collectBalls(); lastScan=now end
     if now-lastResize>=0.2 then resizeBalls(); updateReceiveHitbox(); lastResize=now end
     local root=rootPart(LocalPlayer)
     local grounded=isGrounded(root)
     jumpRotation(root,grounded,active and not opened,now)
+    trackApproaches(now,root,active and not opened)
     if active then
         prediction(now); facingLines()
         renderMenu()
     end
     if not running then return end
-    trackApproaches(now,root,active and not opened)
     autoSet(now,root,active,grounded)
     for id,d in pairs(draws) do
         if not seen[id] then d:Remove(); draws[id]=nil end
@@ -700,4 +799,4 @@ task.spawn(function()
     end
 end)
 -- Local test seam / useful handle for runtimes that retain loadstring return values.
-return {Stop=stop,Settings=cfg,Set=set,Frame=frame,LandingTime=landingTime,Grounded=isGrounded}
+return {Stop=stop,Settings=cfg,Set=set,Frame=frame,LandingTime=landingTime,Grounded=isGrounded,ContactTime=contactTime,Match=function() return match end}
